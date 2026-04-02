@@ -1,19 +1,13 @@
-require('dotenv').config();
+require("dotenv").config();
 
 const dns = require("dns");
 dns.setDefaultResultOrder("ipv4first");
 
-const fetch = require('node-fetch');
-
-
-const mondayQueries = require('./monday-queries');
-const motiveQueries = require('./motive-queries');
+const fetch = require("node-fetch");
 const cron = require("node-cron");
 
-
-
-
-
+const mondayQueries = require("./monday-queries");
+const motiveQueries = require("./motive-queries");
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_USER_ID;
@@ -21,452 +15,574 @@ const CHAT_ID = process.env.TELEGRAM_USER_ID;
 const MONDAY_API_TOKEN = process.env.MONDAY_API_TOKEN;
 const MONDAY_BASE_URL = process.env.MONDAY_BASE_URL;
 
-const MONITORING_BOARD_ID =  process.env.MONITORING_BOARD_ID;
+const MONITORING_BOARD_ID = process.env.MONITORING_BOARD_ID;
 
 const MOTIVE_BASE_URL = process.env.MOTIVE_BASE_URL;
 const MOTIVE_X_API_KEY = process.env.MOTIVE_X_API_KEY;
-
 const MOTIVE_X_WEB_USER_AUTH = process.env.MOTIVE_X_WEB_USER_AUTH;
+
 const MOTIVE_FILTERED_GROUP_ID = process.env.MOTIVE_FILTERED_GROUP_ID;
-const MOTIVE_TRUCKID_COLUMN_ID =  process.env.MOTIVE_TRUCKID_COLUMN_ID;
+const MOTIVE_TRUCKID_COLUMN_ID = process.env.MOTIVE_TRUCKID_COLUMN_ID;
 
 const {
-  MONITORING_BOARD_NAME_COL_ID ,
-  MONITORING_BOARD_TRUCKID_COL_ID, 
-  MONITORING_BOARD_TRUCK_NUMBER_COL_ID,   
-  MONITORING_BOARD_DASHCAM_STATUS_COL_ID, 
-  MONITORING_BOARD_DEF_PRCNT_COL_ID ,
-  MONITORING_BOARD_FUEL_PRCNT_COL_ID ,
-  MONITORING_BOARD_CAM_LAST_CAPTURE_COL_ID,             
+  MONITORING_BOARD_NAME_COL_ID,
+  MONITORING_BOARD_TRUCKID_COL_ID,
+  MONITORING_BOARD_TRUCK_NUMBER_COL_ID,
+  MONITORING_BOARD_DASHCAM_STATUS_COL_ID,
+  MONITORING_BOARD_DEF_PRCNT_COL_ID,
+  MONITORING_BOARD_FUEL_PRCNT_COL_ID,
+  MONITORING_BOARD_CAM_LAST_CAPTURE_COL_ID,
   MONITORING_BOARD_LOCATION_COL_ID,
-  MONITORING_BOARD_LOCATION_UPDATE_DATE_COL_ID, 
-  MONITORING_BOARD_SPEED_COL_ID ,
+  MONITORING_BOARD_LOCATION_UPDATE_DATE_COL_ID,
+  MONITORING_BOARD_SPEED_COL_ID,
   MONITORING_BOARD_CURRENT_STATE_COL_ID,
-  MONITORING_BOARD_STATE_SINCE_COL_ID, 
-  MONITORING_BOARD_SEAT_BELT_COL_ID ,
-  MONITORING_BOARD_TELEMATICS_UPDATE_DATE_COL_ID 
+  MONITORING_BOARD_STATE_SINCE_COL_ID,
+  MONITORING_BOARD_SEAT_BELT_COL_ID,
+  MONITORING_BOARD_TELEMATICS_UPDATE_DATE_COL_ID,
 } = process.env;
 
+const BATCH_SIZE = 1;
+const BATCH_CONCURRENCY = 3;
+const MOTIVE_FOLLOW_CONCURRENCY = 3;
 
-const BATCH_SIZE = 20;        // << group into 20 ops
-const BATCH_CONCURRENCY = 3;  // run up to 3 batches in parallel (tweak if needed)
-
-
-
-
-
-main();
+main().catch((err) => {
+  console.error("Startup run failed:", err);
+});
 
 async function main() {
 
-    // fetching trailer board truck numbers and row IDs 
-    const mondayTrBoardContentsResponse = await makeApiRequest({      
-        url:MONDAY_BASE_URL,
-        method:'POST',
-        body:{
-            query: await mondayQueries.getColumnValuesFilterGroupAndColumn(MONITORING_BOARD_ID,MOTIVE_FILTERED_GROUP_ID,MOTIVE_TRUCKID_COLUMN_ID),
-        },        
-        token : MONDAY_API_TOKEN
-    });
+  const mondayTrBoardContentsResponse = await makeApiRequest({
+    url: MONDAY_BASE_URL,
+    method: "POST",
+    body: {
+      query: mondayQueries.getColumnValuesFilterGroupAndColumn(
+        MONITORING_BOARD_ID,
+        MOTIVE_FILTERED_GROUP_ID,
+        MOTIVE_TRUCKID_COLUMN_ID
+      ),
+    },
+    token: MONDAY_API_TOKEN,
+  });
 
-    const motiveTruckInfosResponse = await makeApiRequest({
-        url: MOTIVE_BASE_URL+"v1/vehicles?per_page=100&page_no=1",           // fetches 100 truckInfos perPage
-        method:'GET',
-        headers : {
-            'x-api-key': MOTIVE_X_API_KEY
-        }
-    });
+  if (!mondayTrBoardContentsResponse?.data?.boards?.[0]?.items_page?.items) {
+    throw new Error(
+      "Failed to load existing monday board items. Aborting to avoid duplicate row creation."
+    );
+  }
 
-    const boardTruckNumberIDArray = mondayTrBoardContentsResponse?.data?.boards?.[0]?.items_page?.items;
-    const rowIdToTruckIdMap = new Map();
-    const truckIdToRowIdMap = new Map();
+  const motiveTruckInfosResponse = await makeApiRequest({
+    url: `${MOTIVE_BASE_URL}v1/vehicles?per_page=100&page_no=1`,
+    method: "GET",
+    headers: {
+      "x-api-key": MOTIVE_X_API_KEY,
+    },
+  });
 
-    if(Array.isArray(boardTruckNumberIDArray) && boardTruckNumberIDArray.length>0){
+  const boardTruckNumberIDArray = mondayTrBoardContentsResponse?.data?.boards?.[0]?.items_page?.items || [];
 
-      for(const item of boardTruckNumberIDArray) {
-        const truckId = item.column_values?.[0]?.text ?? null; 
-        const rowId = item?.id;
+  const rowIdToTruckIdMap = new Map();
+  const truckIdToRowIdMap = new Map();
+
+  if (Array.isArray(boardTruckNumberIDArray) && boardTruckNumberIDArray.length > 0) {
+    for (const item of boardTruckNumberIDArray) {
+      const truckId = item?.column_values?.[0]?.text ?? null;
+      const rowId = item?.id;
+
+      if (rowId) {
         rowIdToTruckIdMap.set(rowId, truckId);
-        if(truckId){
-          truckIdToRowIdMap.set(String(truckId),rowId);
-        }
       }
 
+      if (truckId) {
+        truckIdToRowIdMap.set(String(truckId), rowId);
+      }
     }
-    
-    
-   
+  }
 
-    const motiveTruckInfoArray = motiveTruckInfosResponse?.vehicles;   
+  const motiveTruckInfoArray = motiveTruckInfosResponse?.vehicles || [];
+  if (!Array.isArray(motiveTruckInfoArray) || motiveTruckInfoArray.length === 0) {
+    console.warn("No vehicles returned from Motive.");
+    return;
+  }
 
-    const motiveTruckInfoQueriesArray = [];
-    const unknownTruckIdNumberObjectArray =[];
+  const motiveTruckInfoQueriesArray = [];
 
-    for(const truck of motiveTruckInfoArray){           // setting truck Number to Truck ID 
-        const truckId = truck?.vehicle?.id;
-        const truckNumber = String(truck?.vehicle?.number);        
-        if(truckId){
-          motiveTruckInfoQueriesArray.push(motiveQueries.getCurrentTruckInfo(truckId));
-        }
+  for (const truck of motiveTruckInfoArray) {
+    const truckId = truck?.vehicle?.id;
+    if (truckId) {
+      motiveTruckInfoQueriesArray.push(motiveQueries.getCurrentTruckInfo(truckId));
+    }
+  }
+
+  const truckInfoResults = await fetchWithLimit(
+    motiveTruckInfoQueriesArray,
+    MOTIVE_FOLLOW_CONCURRENCY
+  );
+
+  const truckIdToTruckDataMap = new Map();
+
+  for (const result of truckInfoResults) {
+    const truckInfo = result?.travel_group;
+
+    if (!truckInfo?.vehicle?.id) {
+      continue;
     }
 
+    const truckStatus = truckInfo?.vehicle?.status;
+    if (truckStatus === "deactivated") {
+      continue;
+    }
 
-   
-   
-   
+    const truckId = truckInfo?.vehicle?.id;
+    const truckNumber = truckInfo?.vehicle?.number ?? "N/A";
 
+    const driverFirstName = truckInfo?.driver?.first_name || "";
+    const driverLastName = truckInfo?.driver?.last_name || "";
 
-    const truckInfoResults = await fetchWithLimit(motiveTruckInfoQueriesArray);
-    const truckIdToTruckDataMap = new Map();
+    let dashCamStatus =
+      truckInfo?.vehicle?.dashcam_status === "camera_obstructed"
+        ? "Obstructed"
+        : truckInfo?.vehicle?.dashcam_status || "N/A";
 
+    const cameraLastCaptureRaw =
+      truckInfo?.vehicle?.image_check?.last_image_metadata?.image_received_time || null;
 
-    
-    for(let truckInfo of truckInfoResults){
-      truckInfo = truckInfo.travel_group;
-      const  truckStatus = truckInfo?.vehicle?.status;
-
-      if(truckStatus == "deactivated"){
-        continue;
+    if (dashCamStatus !== "N/A") {
+      const lastCapturedImageInMinutes = diffInMinutes(cameraLastCaptureRaw);
+      if (
+        typeof lastCapturedImageInMinutes === "number" &&
+        lastCapturedImageInMinutes > 240
+      ) {
+        dashCamStatus = "Freezed";
       }
+    }
 
-      const truckId = truckInfo?.vehicle?.id;
-      const truckNumber = truckInfo?.vehicle?.number;
-      const driverFirstName = truckInfo?.driver?.first_name;
-      const driverLastName = truckInfo?.driver?.last_name;
-      
-      let dashCamStatus = truckInfo?.vehicle?.dashcam_status == "camera_obstructed" ? "Obstructed" : truckInfo?.vehicle?.dashcam_status;
-      let cameraLastCaptureDate = truckInfo?.vehicle?.image_check?.last_image_metadata?.image_received_time || null;
+    const latitude = truckInfo?.current_location?.lat ?? null;
+    const longitude = truckInfo?.current_location?.lon ?? null;
+    const formattedAddress = truckInfo?.current_location?.formatted_address || "N/A";
 
-      if(dashCamStatus){
-        const lastCapturedImageInMinutes = diffInMinutes(cameraLastCaptureDate);        
-        if(lastCapturedImageInMinutes && lastCapturedImageInMinutes > 240 ){
-          dashCamStatus = "Freezed";
-        }        
-      }else{
-          dashCamStatus= "N/A"
-      }
-      
-      cameraLastCaptureDate = formatToEasternTime(cameraLastCaptureDate);
-       
+    const locationUpdatedRaw = truckInfo?.current_location?.located_at || null;
+    const currentState = truckInfo?.current_state?.entity_state || "N/A";
+    const currentSpeed = truckInfo?.current_location?.ground_speed_kph ?? "N/A";
+    const currentStateSinceRaw =
+      truckInfo?.current_state?.entity_state_last_updated || null;
 
-      
-      
-      
-      const latitude = truckInfo?.current_location?.lat;
-      const longitude = truckInfo?.current_location?.lon;
-      const formattedAddress = truckInfo?.current_location?.formatted_address;
-      let locationUpdatedDate = truckInfo?.current_location?.located_at || null;
-      locationUpdatedDate = formatToEasternTime(locationUpdatedDate);
+    const currentTotalIdleSeconds =
+      truckInfo?.current_state?.total_idle_seconds ?? 0;
 
-      const currentState = truckInfo?.current_state?.entity_state;
-      const currentSpeed = truckInfo?.current_state?.ground_speed_kph;
-      let currentStateSince = truckInfo?.current_state?.entity_state_last_updated || null;
-      currentStateSince = formatToEasternTime(currentStateSince);
-      const currentTotalIdleSeconds = truckInfo?.current_state?.total_idle_seconds;
+    const driverSeatBeltStatus =
+      truckInfo?.telematics_state?.driver_seat_belt_status != null
+        ? String(truckInfo.telematics_state.driver_seat_belt_status)
+        : "N/A";
 
-      const driverSeatBeltStatus = truckInfo?.telematics_state?.driver_seat_belt_status;
+    const defPrcnt =
+      truckInfo?.telematics_state?.def_level_percent ??
+      null;
 
-      const defPrcnt = truckInfo?.telematics_state?.def_level_percent;
-      const fuelPrcnt = truckInfo?.telematics_state?.fuel_level_percent;
-      const odometer = truckInfo?.telematics_state?.odometer;
-      const engineHours =truckInfo?.telematics_state?.engine_hours;
-      let telematicsLastUpdateDate = truckInfo?.telematics_state?.max_last_updated_at || null;
-      telematicsLastUpdateDate = formatToEasternTime(telematicsLastUpdateDate);
-      
-      
-    
+    const fuelPrcnt =
+      truckInfo?.telematics_state?.fuel_level_percent ?? null;
 
+    const telematicsLastUpdateRaw =
+      truckInfo?.telematics_state?.max_last_updated_at || null;
 
-      const truckInfoObject ={
-        truckId,
-        truckNumber,
-        driverFirstName,
-        driverLastName,
-        dashCamStatus,
-        cameraLastCaptureDate:diffToText(cameraLastCaptureDate),
-        latitude,
-        longitude,
-        formattedAddress,
-        locationUpdatedDate : diffToText(locationUpdatedDate),
-        currentState,
-        currentSpeed,
-        currentStateSince: diffToText(currentStateSince),
-        currentTotalIdleSeconds,
-        driverSeatBeltStatus,
-        defPrcnt,
-        fuelPrcnt,
-        telematicsLastUpdateDate : diffToText(telematicsLastUpdateDate)
-      }     
-      truckIdToTruckDataMap.set(truckId,truckInfoObject);
-       
-    }   
+    const truckInfoObject = {
+      truckId,
+      truckNumber,
+      driverFirstName,
+      driverLastName,
+      dashCamStatus,
+      cameraLastCaptureDate: diffToText(cameraLastCaptureRaw),
+      latitude,
+      longitude,
+      formattedAddress,
+      locationUpdatedDate: diffToText(locationUpdatedRaw),
+      currentState,
+      currentSpeed,
+      currentStateSince: diffToText(currentStateSinceRaw),
+      currentTotalIdleSeconds,
+      driverSeatBeltStatus,
+      defPrcnt,
+      fuelPrcnt,
+      telematicsLastUpdateDate: diffToText(telematicsLastUpdateRaw),
+    };
 
-    
-    let ops = [];
-    
-    
+    truckIdToTruckDataMap.set(String(truckId), truckInfoObject);
+  }
 
-    for(const [truckId, truckInfo] of truckIdToTruckDataMap){
+  const ops = [];
 
-          const driverFullName = `${truckInfo.driverFirstName} ${truckInfo.driverLastName}` || "N/A";
-          
-          const colValues ={
-          [MONITORING_BOARD_LOCATION_COL_ID]:{                   // change link column 
-            "url":`www.google.com/maps/search/?api=1&query=${truckInfo.latitude},${truckInfo.longitude}`,
-            "text" :`${truckInfo.formattedAddress}`
+  for (const [truckId, truckInfo] of truckIdToTruckDataMap) {
+    const driverFullName =
+      [truckInfo.driverFirstName, truckInfo.driverLastName]
+        .filter(Boolean)
+        .join(" ")
+        .trim() || "N/A";
+
+    const hasCoordinates =
+      truckInfo.latitude != null && truckInfo.longitude != null;
+
+    const colValues = {
+      [MONITORING_BOARD_LOCATION_COL_ID]: hasCoordinates
+        ? {
+            url: `https://www.google.com/maps/search/?api=1&query=${truckInfo.latitude},${truckInfo.longitude}`,
+            text: truckInfo.formattedAddress || "N/A",
+          }
+        : {
+            url: "",
+            text: truckInfo.formattedAddress || "N/A",
           },
-          
-          [MONITORING_BOARD_TRUCKID_COL_ID]:`${truckInfo.truckId}`,     
-          [MONITORING_BOARD_TRUCK_NUMBER_COL_ID] : `${truckInfo.truckNumber}`,       
-          [MONITORING_BOARD_DASHCAM_STATUS_COL_ID] : `${truckInfo.dashCamStatus}`,
-          [MONITORING_BOARD_DEF_PRCNT_COL_ID]: `${truckInfo.fuelPrcnt}`,
-          [MONITORING_BOARD_FUEL_PRCNT_COL_ID]: `${truckInfo.defPrcnt}`,
-          [MONITORING_BOARD_CAM_LAST_CAPTURE_COL_ID]:`${truckInfo.cameraLastCaptureDate}`,
-          [MONITORING_BOARD_LOCATION_UPDATE_DATE_COL_ID]:`${truckInfo.locationUpdatedDate}`,
-          [MONITORING_BOARD_CURRENT_STATE_COL_ID] : `${truckInfo.currentState}`,
-          [MONITORING_BOARD_SPEED_COL_ID] : `${truckInfo.currentSpeed}`,
-          [MONITORING_BOARD_STATE_SINCE_COL_ID] : `${truckInfo.currentStateSince}`,
-          [MONITORING_BOARD_SEAT_BELT_COL_ID] :`${truckInfo.driverSeatBeltStatus}`,
-          [MONITORING_BOARD_TELEMATICS_UPDATE_DATE_COL_ID] :`${truckInfo.telematicsLastUpdateDate}`         
-        }
-        const rowId = truckIdToRowIdMap.get(String(truckId));
 
-        if(rowId){        
-          colValues[MONITORING_BOARD_NAME_COL_ID] = driverFullName;
-          ops.push(mondayQueries.updateMultipleAlliasColumnValuesQuery(MONITORING_BOARD_ID,rowId,colValues));                
-            
-        }else{
-          ops.push(mondayQueries.createMultipleAlliasColumnValuesQuery(ops.length,MONITORING_BOARD_ID,MOTIVE_FILTERED_GROUP_ID,driverFullName,colValues));
-        }
-    }
-    
-  
-    const updateBatches = chunk(ops, BATCH_SIZE).map(buildAliasedMutation);
+      [MONITORING_BOARD_TRUCKID_COL_ID]: String(truckInfo.truckId ?? ""),
+      [MONITORING_BOARD_TRUCK_NUMBER_COL_ID]: String(truckInfo.truckNumber ?? ""),
+      [MONITORING_BOARD_DASHCAM_STATUS_COL_ID]: String(truckInfo.dashCamStatus ?? "N/A"),
+      [MONITORING_BOARD_DEF_PRCNT_COL_ID]:
+        truckInfo.defPrcnt != null ? String(truckInfo.defPrcnt) : "",
+      [MONITORING_BOARD_FUEL_PRCNT_COL_ID]:
+        truckInfo.fuelPrcnt != null ? String(truckInfo.fuelPrcnt) : "",
+      [MONITORING_BOARD_CAM_LAST_CAPTURE_COL_ID]: String(
+        truckInfo.cameraLastCaptureDate ?? "N/A"
+      ),
+      [MONITORING_BOARD_LOCATION_UPDATE_DATE_COL_ID]: String(
+        truckInfo.locationUpdatedDate ?? "N/A"
+      ),
+      [MONITORING_BOARD_CURRENT_STATE_COL_ID]: String(truckInfo.currentState ?? "N/A"),
+      [MONITORING_BOARD_SPEED_COL_ID]: String(truckInfo.currentSpeed ?? "N/A"),
+      [MONITORING_BOARD_STATE_SINCE_COL_ID]: String(
+        truckInfo.currentStateSince ?? "N/A"
+      ),
+      [MONITORING_BOARD_SEAT_BELT_COL_ID]: String(
+        truckInfo.driverSeatBeltStatus ?? "N/A"
+      ),
+      [MONITORING_BOARD_TELEMATICS_UPDATE_DATE_COL_ID]: String(
+        truckInfo.telematicsLastUpdateDate ?? "N/A"
+      ),
+    };
 
-   
-
-
-    if (updateBatches.length) {
-      await runBatches(updateBatches);
-    }
     
 
+
+    const rowId = truckIdToRowIdMap.get(String(truckId));
+
+    if (rowId) {
+      colValues[MONITORING_BOARD_NAME_COL_ID] = driverFullName;
+      ops.push({
+        query: mondayQueries.updateMultipleAlliasColumnValuesQuery(
+          MONITORING_BOARD_ID,
+          rowId,
+          colValues
+        ), 
+         meta: {
+          truckId,
+          rowId,
+          driverFullName,
+          defPrcnt: truckInfo.defPrcnt,
+          fuelPrcnt: truckInfo.fuelPrcnt,
+          currentSpeed: truckInfo.currentSpeed,
+          currentState: truckInfo.currentState,
+          mode: "update",
+        },
+    });
+    } else {
+      ops.push({
+        query : mondayQueries.createMultipleAlliasColumnValuesQuery(
+          ops.length,
+          MONITORING_BOARD_ID,
+          MOTIVE_FILTERED_GROUP_ID,
+          driverFullName,
+          colValues
+        ),
+         meta: {
+          truckId,
+          rowId: null,
+          driverFullName,
+          defPrcnt: truckInfo.defPrcnt,
+          fuelPrcnt: truckInfo.fuelPrcnt,
+          currentSpeed: truckInfo.currentSpeed,
+          currentState: truckInfo.currentState,
+          mode: "create",
+        },
+
+    });
+    }
+  }
+
+  const updateBatches = chunk(ops, BATCH_SIZE).map((batch) => ({
+    query: buildAliasedMutation(batch.map((x) => x.query)),
+    meta: batch.map((x) => x.meta),
+  }));
+
+  if (updateBatches.length) {
+    await runBatches(updateBatches);
+  }
+
+  console.log(`Sync complete. Processed ${truckIdToTruckDataMap.size} trucks.`);
 }
-
-
-
 
 function chunk(arr, size) {
   const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
   return out;
 }
 
-
 function buildAliasedMutation(ops) {
-  return `mutation{\n${ops.join('\n')}\n}`;
+  return `mutation {\n${ops.join("\n")}\n}`;
 }
-
-
-  
 
 async function runBatches(batchQueries, concurrency = BATCH_CONCURRENCY) {
   let i = 0;
-  const workers = new Array(Math.min(concurrency, batchQueries.length)).fill(0).map(async () => {
-    while (i < batchQueries.length) {
-      const idx = i++;
-      await makeApiRequest({
-          url:MONDAY_BASE_URL,
-          method:'POST',
-          token : MONDAY_API_TOKEN,
+
+  const workers = new Array(Math.min(concurrency, batchQueries.length))
+    .fill(0)
+    .map(async () => {
+      while (i < batchQueries.length) {
+        const idx = i++;
+
+        const result = await makeApiRequest({
+          url: MONDAY_BASE_URL,
+          method: "POST",
+          token: MONDAY_API_TOKEN,
           body: {
-            query:batchQueries[idx]
-          } 
-        } 
-      );
-    
-    }
-  });
+            query: batchQueries[idx].query,
+          },
+        });
+
+        if (result?.errors?.length) {
+          console.warn(`Request ${idx + 1}/${batchQueries.length} failed with GraphQL errors`);
+          console.dir(result.errors, { depth: null });
+          console.dir(batchQueries[idx].meta, { depth: null });
+        }
+
+
+        if (result === null) {
+          console.warn(`Request ${idx + 1}/${batchQueries.length} failed with no response after retries`);
+          console.dir(batchQueries[idx].meta, { depth: null });
+        }
+
+
+      }
+    });
+
   await Promise.all(workers);
 }
 
-
-
-
-
-
-function formatToEasternTime(input) { 
-  if(!input){
-    return 'N/A';
-  }
-  const date = new Date(input);
-  
-  return new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    month: 'short',       // "May"
-    day: 'numeric',      // "2"
-    year: 'numeric',     // "2025"
-    hour: 'numeric',     // "2"
-    minute: '2-digit',   // "07"
-    hour12: true,        // "PM"
-    timeZoneName: 'short' // "EDT"
-  }).format(date);
-}
-
-
-
 function diffToText(earlier, later = new Date()) {
-  if(earlier =="N/A"){
-    return "N/A"
-  }
+  if (!earlier) return "N/A";
 
-  const start = (earlier instanceof Date) ? earlier : new Date(earlier);
-  const end   = (later   instanceof Date) ? later   : new Date(later);
+  const start = earlier instanceof Date ? earlier : new Date(earlier);
+  const end = later instanceof Date ? later : new Date(later);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return "N/A";
+  }
 
   let diffMs = end - start;
-
-  if (diffMs < 0) {
-    // if earlier is actually in the future
-    diffMs = -diffMs;
-  }
+  if (diffMs < 0) diffMs = Math.abs(diffMs);
 
   const totalMinutes = Math.floor(diffMs / (1000 * 60));
-  const days   = Math.floor(totalMinutes / (60 * 24));
-  const hours  = Math.floor((totalMinutes % (60 * 24)) / 60);
-  const mins   = totalMinutes % 60;
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+  const mins = totalMinutes % 60;
 
   const parts = [];
-  if (days)  parts.push(`${days} day${days !== 1 ? "s" : ""}`);
+  if (days) parts.push(`${days} day${days !== 1 ? "s" : ""}`);
   if (hours) parts.push(`${hours} hour${hours !== 1 ? "s" : ""}`);
   if (mins || parts.length === 0) {
     parts.push(`${mins} minute${mins !== 1 ? "s" : ""}`);
   }
 
-  return parts.join(" ") + " ago";
+  return `${parts.join(" ")} ago`;
 }
 
-
 function diffInMinutes(startDate, endDate = new Date()) {
+  if (!startDate) return null;
+
   const dateA = startDate instanceof Date ? startDate : new Date(startDate);
   const dateB = endDate instanceof Date ? endDate : new Date(endDate);
 
-  // if either date is invalid, return null (or throw, your choice)
   if (Number.isNaN(dateA.getTime()) || Number.isNaN(dateB.getTime())) {
-    return "N/A";
+    return null;
   }
 
-  const diffMs = dateB.getTime() - dateA.getTime(); // ms difference
-  const diffMinutes = diffMs / (1000 * 60);         // convert to minutes
-
-  return diffMinutes; // can be negative if b < a
+  return (dateB.getTime() - dateA.getTime()) / (1000 * 60);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
+function isRetryableStatus(status) {
+  return [500, 502, 503, 504].includes(status);
+}
+
+function redactHeaders(headers = {}) {
+  const safeHeaders = { ...headers };
+  for (const key of ["Authorization", "x-api-key", "x-web-user-auth"]) {
+    if (safeHeaders[key]) {
+      safeHeaders[key] = "[REDACTED]";
+    }
+  }
+  return safeHeaders;
+}
+
+function hasRetryableMondayGraphQLError(responseData) {
+  if (!responseData || !Array.isArray(responseData.errors)) return false;
+
+  const text = JSON.stringify(responseData.errors).toLowerCase();
+
+  return (
+    text.includes("timeout") ||
+    text.includes("internal server error") ||
+    text.includes("bad gateway") ||
+    text.includes("gateway timeout") ||
+    text.includes("temporar") ||
+    text.includes("exception")
+  );
+}
 
 async function makeApiRequest({
   url,
-  method = 'GET',
-  body,                 // request body (object, string, FormData, etc.)
-  headers = {},         // custom headers
-  token,                // optional Bearer token
-  queryParams,          // optional query-string params as object
+  method = "GET",
+  body,
+  headers = {},
+  token,
+  queryParams,
+  retries = 4,
+  retryDelayMs = 1000,
 }) {
-  try {
-    // --- Build final URL with query params if provided ---
-    let finalUrl = url;
-    if (queryParams && typeof queryParams === 'object') {
-      const qs = new URLSearchParams(queryParams).toString();
-      if (qs) {
-        finalUrl += (finalUrl.includes('?') ? '&' : '?') + qs;
+  let finalUrl = url;
+
+  if (queryParams && typeof queryParams === "object") {
+    const qs = new URLSearchParams(queryParams).toString();
+    if (qs) {
+      finalUrl += (finalUrl.includes("?") ? "&" : "?") + qs;
+    }
+  }
+
+  const finalHeaders = { ...headers };
+  if (token) {
+    finalHeaders.Authorization = token;
+  }
+
+  const options = {
+    method: method.toUpperCase(),
+    headers: finalHeaders,
+  };
+
+  if (body !== undefined && options.method !== "GET" && options.method !== "HEAD") {
+    const isSpecialBody =
+      body instanceof FormData ||
+      body instanceof URLSearchParams ||
+      typeof body === "string" ||
+      body instanceof Blob ||
+      body instanceof ArrayBuffer;
+
+    if (isSpecialBody) {
+      options.body = body;
+    } else {
+      options.body = JSON.stringify(body);
+      if (!finalHeaders["Content-Type"] && !finalHeaders["content-type"]) {
+        finalHeaders["Content-Type"] = "application/json";
       }
     }
-    
-    
-    // --- Build headers dynamically ---
-    const finalHeaders = { ...headers };
-    if (token) {
-      finalHeaders.Authorization = `Bearer ${token}`;
-    }
+  }
 
-    const options = {
-      method: method.toUpperCase(),
-      headers: finalHeaders,
-    };
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(finalUrl, options);
+      const contentType = response.headers.get("content-type") || "";
 
-    // --- Attach body only for non-GET/HEAD methods ---
-    if (body !== undefined && options.method !== 'GET' && options.method !== 'HEAD') {
-      // If body is FormData, URLSearchParams, string, Blob, etc. -> send as is
-      const isSpecialBody =
-        body instanceof FormData ||
-        body instanceof URLSearchParams ||
-        typeof body === 'string' ||
-        body instanceof Blob ||
-        body instanceof ArrayBuffer;
-
-      if (isSpecialBody) {
-        options.body = body;
+      let responseData;
+      if (contentType.includes("application/json")) {
+        responseData = await response.json();
       } else {
-        // Assume plain object → send as JSON
-        options.body = JSON.stringify(body);
+        responseData = await response.text();
+      }
 
-        // Only set Content-Type if user didn’t already override it
-        if (!finalHeaders['Content-Type'] && !finalHeaders['content-type']) {
-          finalHeaders['Content-Type'] = 'application/json';
+      if (!response.ok) {
+        console.error("API request failed:", {
+          url: finalUrl,
+          method: options.method,
+          status: response.status,
+          statusText: response.statusText,
+          headers: redactHeaders(finalHeaders),
+          responseData,
+          attempt,
+        });
+
+        if (attempt < retries && isRetryableStatus(response.status)) {
+          await sleep(retryDelayMs * Math.pow(2, attempt - 1));
+          continue;
         }
+
+        return null;
       }
-    }
 
-    const response = await fetch(finalUrl, options);
+      if (
+        finalUrl.includes("monday.com") &&
+        responseData &&
+        Array.isArray(responseData.errors)
+      ) {
+       
 
-    // Try to parse JSON if possible, otherwise return text
-    const contentType = response.headers.get('content-type') || '';
-    const responseData = contentType.includes('application/json')
-      ? await response.json()
-      : await response.text();
+        console.error("Monday GraphQL error:");
+        console.dir(responseData, { depth: null });
+        
 
-    if (!response.ok) {
-      const safeHeaders = { ...finalHeaders };
-      for (const k of ["Authorization","x-api-key","x-web-user-auth"]) {
-        if (safeHeaders[k]) safeHeaders[k] = "[REDACTED]";
+        if (attempt < retries && hasRetryableMondayGraphQLError(responseData)) {
+          await sleep(retryDelayMs * Math.pow(2, attempt - 1));
+          continue;
+        }
+
+        return responseData;
       }
-      console.error("API request failed:", {
+
+      return responseData;
+    } catch (error) {
+      console.error("Error in API request:", {
         url: finalUrl,
         method: options.method,
-        status: response.status,
-        statusText: response.statusText,
-        headers: safeHeaders,
-        responseData,
+        headers: redactHeaders(finalHeaders),
+        error: error instanceof Error ? error.message : String(error),
+        attempt,
       });
+
+      if (attempt < retries) {
+        await sleep(retryDelayMs * Math.pow(2, attempt - 1));
+        continue;
+      }
+
       return null;
     }
-
-    return responseData;
-  } catch (error) {
-    console.error('Error in API request:', error);
-    return null;
   }
+
+  return null;
 }
 
-
-
-
-
+function escapeMarkdown(text = "") {
+  return String(text).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+}
 
 async function sendErrorToTelegram(messageText) {
-  const message = `🚨 *Alert!* 🚨\n\n${escapeMarkdown(messageText)}`;
+  if (!TELEGRAM_BOT_TOKEN || !CHAT_ID) {
+    console.warn("Telegram credentials are missing. Skipping Telegram alert.");
+    return;
+  }
+
+  const message = `*Motive Monitor Error* 🚨\n\n${escapeMarkdown(messageText)}`;
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
   const params = {
     chat_id: CHAT_ID,
     text: message,
-    parse_mode: "Markdown"
+    parse_mode: "MarkdownV2",
   };
 
   try {
     const telegramRes = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params)
+      body: JSON.stringify(params),
     });
 
     if (!telegramRes.ok) {
@@ -474,23 +590,16 @@ async function sendErrorToTelegram(messageText) {
       throw new Error(`Telegram API error: ${errorText}`);
     }
 
-    console.log("✅ Telegram alert sent");
+    console.log("Telegram alert sent");
   } catch (err) {
-    console.error("❌ Failed to send Telegram message:", err);
+    console.error("Failed to send Telegram message:", err);
   }
 }
 
-
-
-
-
-
-
-let isRunning = false; // to prevent overlap
-
+let isRunning = false;
 
 cron.schedule(
-  "*/15 * * * *",  // every 30 minutes
+  "*/15 * * * *",
   async () => {
     if (isRunning) {
       console.log("Cron: previous run still in progress, skipping this one");
@@ -498,23 +607,24 @@ cron.schedule(
     }
 
     isRunning = true;
-    console.log("Cron: starting runMotiveScrapping at", new Date().toISOString());
+    console.log("Cron: starting run at", new Date().toISOString());
 
     try {
       await main();
-      console.log("Cron: finished runMotiveScrapping");
+      console.log("Cron: finished run");
     } catch (err) {
-      console.error("Cron: error in runMotiveScrapping:", err);
+      console.error("Cron: error in run:", err);
+      await sendErrorToTelegram(
+        err instanceof Error ? err.message : String(err)
+      );
     } finally {
       isRunning = false;
     }
   },
   {
-    timezone: "America/New_York", // optional, but nice for your EST use case
+    timezone: "America/New_York",
   }
 );
-
-
 
 async function fetchWithLimit(urls, limit = 5) {
   const results = new Array(urls.length);
@@ -530,20 +640,19 @@ async function fetchWithLimit(urls, limit = 5) {
       try {
         const data = await makeApiRequest({
           url,
-          method: 'GET', // optional if your helper auto-chooses GET
+          method: "GET",
           headers: {
-            'x-web-user-auth': MOTIVE_X_WEB_USER_AUTH,
+            "x-web-user-auth": MOTIVE_X_WEB_USER_AUTH,
           },
         });
 
         if (data === null) {
-          // makeApiRequest already logged the error
           results[current] = {
             url,
-            error: 'Request failed (makeApiRequest returned null)',
+            error: "Request failed (makeApiRequest returned null)",
           };
         } else {
-          results[current] = data; // already parsed JSON / text
+          results[current] = data;
         }
       } catch (err) {
         results[current] = {

@@ -46,7 +46,12 @@ function duplicateGroupQuery(boardID, groupID) {
 function updateGroupTitleQuery(boardID, groupID, newTitle) {
     return `
         mutation {
-            update_group(board_id: ${boardID}, group_id: "${groupID}", group_attribute: title, new_value: "${newTitle}") {
+            update_group(
+                board_id: ${boardID},
+                group_id: "${groupID}",
+                group_attribute: title,
+                new_value: "${gqlEscape(newTitle)}"
+            ) {
                 id
             }
         }
@@ -267,8 +272,7 @@ module.exports = {
     deleteGoupQuery,
     duplicateGroupQuery,
     getAllItemsInBoard,
-    getColumnValuesFilterGroupAndColumn,
-    updateGroupTitleQuery,
+    getColumnValuesFilterGroupAndColumn,   
     updateGroupColorQuery,
     updateMultipleColumnValuesQuery,
     updateMultipleAlliasColumnValuesQuery,
